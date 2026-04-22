@@ -224,14 +224,6 @@ pytest tests/test_kernels.py -v     # INT8 quantization bounds + vLLM evictor
 
 ---
 
-## Resume Bullets
-
-- Built CachePilot, a GPU memory orchestrator for multi-model LLM serving with a provably optimal KV cache eviction algorithm (PERC), reducing expected KV recompute cost by 25% in simulation and 79% in a vLLM-compatible evictor benchmark vs LRU.
-- Designed PERC (Priority Eviction with Resumption Cost) and proved its optimality via fractional knapsack reduction — jointly models context length and per-session Poisson token arrival rate to minimize expected recompute cost when freeing VRAM.
-- Implemented CUDA C++ kernels for PCIe-saturating KV block eviction (250 µs per 16 MB, 99% overlap with decode) and in-place INT8 KV quantization (50% VRAM reduction, <0.4% relative error bound), plus Triton equivalents and a 47-test suite.
-
----
-
 ## Next Steps
 
 - [ ] Real vLLM integration test on GPT-2 / LLaMA-2
