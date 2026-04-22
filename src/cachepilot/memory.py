@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Set
 
+from .quantization import KVPrecision
+
 BLOCK_SIZE_BYTES = 16 * 1024 * 1024  # 16 MB GPU memory pages
 
 
@@ -129,11 +131,28 @@ class VRAMPool:
         n_heads: int = 32,
         head_dim: int = 128,
         n_layers: int = 32,
-        dtype_bytes: int = 2,
+        dtype_bytes: float = 2.0,
     ) -> int:
         """
         KV cache footprint: 2 * layers * heads * head_dim * seq_len * dtype_bytes.
         (Factor-of-2 because we store both K and V tensors.)
         """
-        kv_bytes = 2 * n_layers * n_heads * head_dim * seq_len * dtype_bytes
+        kv_bytes = int(2 * n_layers * n_heads * head_dim * seq_len * dtype_bytes)
         return max(1, math.ceil(kv_bytes / BLOCK_SIZE_BYTES))
+
+    @staticmethod
+    def blocks_needed_for_tier(
+        seq_len: int,
+        precision: str | KVPrecision = KVPrecision.FP16,
+        n_heads: int = 32,
+        head_dim: int = 128,
+        n_layers: int = 32,
+    ) -> int:
+        tier = KVPrecision.parse(precision)
+        return VRAMPool.blocks_needed(
+            seq_len=seq_len,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            n_layers=n_layers,
+            dtype_bytes=tier.bytes_per_scalar,
+        )

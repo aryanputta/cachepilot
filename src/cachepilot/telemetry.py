@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Dict, List
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -27,6 +27,17 @@ class Snapshot:
     p95_latency_ms: float
     eviction_rate_per_s: float
 
+    def as_metrics(self) -> dict[str, float]:
+        return {
+            "cachepilot_vram_utilization_ratio": self.vram_util,
+            "cachepilot_queue_depth": float(self.queue_depth),
+            "cachepilot_active_sessions": float(self.active_sessions),
+            "cachepilot_tokens_per_second": self.tokens_per_sec,
+            "cachepilot_latency_p50_ms": self.p50_latency_ms,
+            "cachepilot_latency_p95_ms": self.p95_latency_ms,
+            "cachepilot_eviction_rate_per_second": self.eviction_rate_per_s,
+        }
+
 
 class TelemetryCollector:
     """
@@ -39,9 +50,9 @@ class TelemetryCollector:
     WINDOW_S: float = 60.0
 
     def __init__(self) -> None:
-        self._events: Deque[TokenEvent] = deque()
-        self._eviction_ts: Deque[float] = deque()
-        self._snapshots: List[Snapshot] = []
+        self._events: deque[TokenEvent] = deque()
+        self._eviction_ts: deque[float] = deque()
+        self._snapshots: list[Snapshot] = []
         self._start = time.monotonic()
 
     def record_tokens(self, req_id: str, tokens: int, latency_ms: float) -> None:
@@ -86,7 +97,30 @@ class TelemetryCollector:
         self._snapshots.append(s)
         return s
 
-    def summary(self) -> Dict:
+    @property
+    def snapshots(self) -> list[Snapshot]:
+        return list(self._snapshots)
+
+    def latest_snapshot(self) -> Snapshot | None:
+        if not self._snapshots:
+            return None
+        return self._snapshots[-1]
+
+    def latest_eviction_rate(self) -> float:
+        snapshot = self.latest_snapshot()
+        if snapshot is not None:
+            return snapshot.eviction_rate_per_s
+        now = time.monotonic()
+        cutoff = now - self.WINDOW_S
+        recent = [ts for ts in self._eviction_ts if ts >= cutoff]
+        return len(recent) / self.WINDOW_S
+
+    def time_since_last_eviction(self) -> float:
+        if not self._eviction_ts:
+            return self.WINDOW_S
+        return max(time.monotonic() - self._eviction_ts[-1], 0.0)
+
+    def summary(self) -> dict:
         if not self._snapshots:
             return {}
         tpss = [s.tokens_per_sec for s in self._snapshots]
@@ -98,6 +132,27 @@ class TelemetryCollector:
             "mean_vram_util": float(np.mean(utils)),
             "duration_s": time.monotonic() - self._start,
         }
+
+    def to_prometheus(
+        self,
+        extra_metrics: Mapping[str, float] | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> str:
+        snapshot = self.latest_snapshot()
+        metrics = dict(snapshot.as_metrics() if snapshot is not None else {})
+        if extra_metrics:
+            metrics.update({k: float(v) for k, v in extra_metrics.items()})
+
+        label_text = ""
+        if labels:
+            rendered = ",".join(f'{key}="{value}"' for key, value in sorted(labels.items()))
+            label_text = f"{{{rendered}}}"
+
+        lines = []
+        for name, value in sorted(metrics.items()):
+            lines.append(f"# TYPE {name} gauge")
+            lines.append(f"{name}{label_text} {value:.10g}")
+        return "\n".join(lines) + ("\n" if lines else "")
 
     def _trim(self) -> None:
         cutoff = time.monotonic() - self.WINDOW_S * 2

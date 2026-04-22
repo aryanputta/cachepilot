@@ -29,8 +29,8 @@ Output:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from pathlib import Path
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -66,7 +66,11 @@ class TinyMLP:
         h = _relu(x @ self.W1 + self.b1)
         return h @ self.W2 + self.b2
 
-    def predict(self, features: np.ndarray) -> Tuple[float, float]:
+    def forward_with_hidden(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        h = _relu(x @ self.W1 + self.b1)
+        return h, h @ self.W2 + self.b2
+
+    def predict(self, features: np.ndarray) -> tuple[float, float]:
         """
         Returns (admission_score, lambda_estimate).
         admission_score in [0, 1]; lambda_estimate in [0, inf).
@@ -76,12 +80,80 @@ class TinyMLP:
         lambda_est = float(np.exp(np.clip(out[1], -5, 5)))  # softplus-like
         return admission, lambda_est
 
+    def clone(self) -> TinyMLP:
+        clone = TinyMLP(
+            input_dim=self.W1.shape[0],
+            hidden=self.W1.shape[1],
+            output_dim=self.W2.shape[1],
+        )
+        clone.load_state_dict(self.state_dict())
+        return clone
+
+    def state_dict(self) -> dict[str, np.ndarray]:
+        return {
+            "W1": self.W1.copy(),
+            "b1": self.b1.copy(),
+            "W2": self.W2.copy(),
+            "b2": self.b2.copy(),
+        }
+
+    def load_state_dict(self, state: dict[str, np.ndarray]) -> None:
+        self.W1 = np.array(state["W1"], copy=True)
+        self.b1 = np.array(state["b1"], copy=True)
+        self.W2 = np.array(state["W2"], copy=True)
+        self.b2 = np.array(state["b2"], copy=True)
+
+    def save(self, path: str | Path) -> None:
+        target = Path(path)
+        np.savez(target, **self.state_dict())
+
+    @classmethod
+    def load(cls, path: str | Path) -> TinyMLP:
+        state = np.load(Path(path))
+        model = cls(
+            input_dim=state["W1"].shape[0],
+            hidden=state["W1"].shape[1],
+            output_dim=state["W2"].shape[1],
+        )
+        model.load_state_dict({key: state[key] for key in ("W1", "b1", "W2", "b2")})
+        return model
+
     def update_weight(self, dW1, db1, dW2, db2, lr: float = 1e-3) -> None:
         """Gradient descent step (called by imitation learning trainer)."""
         self.W1 -= lr * dW1
         self.b1 -= lr * db1
         self.W2 -= lr * dW2
         self.b2 -= lr * db2
+
+    def policy_gradient_step(
+        self,
+        features: np.ndarray,
+        action: bool,
+        advantage: float,
+        lr: float = 1e-3,
+    ) -> None:
+        """
+        REINFORCE update for the admission Bernoulli head only.
+
+        The lambda-estimation head is intentionally left untouched by the RL
+        update so it can continue to be trained with supervised traces.
+        """
+        h, out = self.forward_with_hidden(features)
+        prob = float(_sigmoid(out[0]))
+        target = 1.0 if action else 0.0
+        dlogit = (target - prob) * advantage
+
+        dW2 = np.zeros_like(self.W2)
+        db2 = np.zeros_like(self.b2)
+        dW2[:, 0] = h * dlogit
+        db2[0] = dlogit
+
+        dh = self.W2[:, 0] * dlogit
+        dpre = dh * (h > 0).astype(float)
+        dW1 = np.outer(features, dpre)
+        db1 = dpre
+
+        self.update_weight(dW1, db1, dW2, db2, lr=lr)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +197,44 @@ class Trace:
     oracle_lambda: float     # true lambda observed from this session
 
 
+@dataclass
+class AdmissionDecision:
+    admit: bool
+    confidence: float
+    probability: float
+    features: np.ndarray
+
+
+@dataclass
+class PolicyGradientSample:
+    features: np.ndarray
+    action: bool
+    probability: float
+
+
+@dataclass
+class RLRunMetrics:
+    reward: float
+    throughput_tok_s: float
+    tokens_total: int
+    requests_dropped: int
+    requests_deferred: int
+    total_eviction_cost_s: float
+    mean_vram_util: float
+
+
+@dataclass
+class FineTuneResult:
+    episodes: int
+    baseline_reward: float
+    tuned_reward: float
+    baseline_drop_rate: float
+    tuned_drop_rate: float
+    baseline_eviction_cost_s: float
+    tuned_eviction_cost_s: float
+    improvement_pct: float
+
+
 class ILTrainer:
     """
     Imitation learning from PERC-oracle traces.
@@ -139,13 +249,13 @@ class ILTrainer:
         self.model = model
         self.lr = lr
         self.batch_size = batch_size
-        self.buffer: List[Trace] = []
-        self.losses: List[float] = []
+        self.buffer: list[Trace] = []
+        self.losses: list[float] = []
 
     def add_trace(self, trace: Trace) -> None:
         self.buffer.append(trace)
 
-    def train_step(self) -> Optional[float]:
+    def train_step(self) -> float | None:
         if len(self.buffer) < self.batch_size:
             return None
 
@@ -201,29 +311,265 @@ class AdmissionPolicy:
     WARMUP_N = 100
     ADMIT_THRESHOLD = 0.5
 
-    def __init__(self, model: Optional[TinyMLP] = None):
+    def __init__(self, model: Optional[TinyMLP] = None, warmup_n: int = WARMUP_N):
         self.model = model or TinyMLP()
         self._n_decisions = 0
+        self._warmup_n = warmup_n
+
+    def decide(
+        self,
+        state: SchedulerState,
+        sample: bool = False,
+        rng: np.random.RandomState | None = None,
+    ) -> AdmissionDecision:
+        self._n_decisions += 1
+        features = extract_features(state)
+
+        if self._n_decisions <= self._warmup_n:
+            admit = state.vram_util < 0.85
+            return AdmissionDecision(
+                admit=admit,
+                confidence=0.5,
+                probability=0.5,
+                features=features,
+            )
+
+        score, _ = self.model.predict(features)
+        if sample:
+            sampler = rng or np.random.RandomState()
+            admit = bool(sampler.rand() < score)
+        else:
+            admit = score > self.ADMIT_THRESHOLD
+
+        return AdmissionDecision(
+            admit=admit,
+            confidence=abs(score - 0.5) * 2,
+            probability=score,
+            features=features,
+        )
 
     def should_admit(self, state: SchedulerState) -> Tuple[bool, float]:
         """
         Returns (admit: bool, confidence: float).
         confidence in [0, 1] — how certain the model is.
         """
-        self._n_decisions += 1
-        features = extract_features(state)
-
-        if self._n_decisions < self.WARMUP_N:
-            admit = state.vram_util < 0.85
-            return admit, 0.5
-
-        score, _ = self.model.predict(features)
-        admit = score > self.ADMIT_THRESHOLD
-        confidence = abs(score - 0.5) * 2  # [0, 1]
-        return admit, confidence
+        decision = self.decide(state, sample=False)
+        return decision.admit, decision.confidence
 
     def estimated_lambda(self, state: SchedulerState) -> float:
         """Return the model's prediction of this session's token arrival rate."""
         features = extract_features(state)
         _, lambda_est = self.model.predict(features)
         return lambda_est
+
+    def reset(self) -> None:
+        self._n_decisions = 0
+
+
+class PolicyGradientTrainer:
+    """
+    Lightweight REINFORCE trainer for the admission controller.
+
+    Reward is derived from whole-run serving metrics so the policy is pushed
+    toward real operational outcomes: more useful tokens, fewer drops, and less
+    recompute waste from evictions.
+    """
+
+    def __init__(
+        self,
+        policy: AdmissionPolicy,
+        lr: float = 5e-4,
+        baseline_momentum: float = 0.9,
+    ) -> None:
+        self.policy = policy
+        self.lr = lr
+        self.baseline_momentum = baseline_momentum
+        self._reward_baseline = 0.0
+
+    def make_sample(
+        self,
+        state: SchedulerState,
+        rng: np.random.RandomState | None = None,
+    ) -> tuple[AdmissionDecision, PolicyGradientSample]:
+        decision = self.policy.decide(state, sample=True, rng=rng)
+        sample = PolicyGradientSample(
+            features=decision.features,
+            action=decision.admit,
+            probability=decision.probability,
+        )
+        return decision, sample
+
+    def update_episode(
+        self,
+        samples: list[PolicyGradientSample],
+        reward: float,
+    ) -> None:
+        advantage = np.clip(reward - self._reward_baseline, -25.0, 25.0)
+        self._reward_baseline = (
+            self.baseline_momentum * self._reward_baseline
+            + (1.0 - self.baseline_momentum) * reward
+        )
+        for sample in samples:
+            self.policy.model.policy_gradient_step(
+                sample.features,
+                sample.action,
+                advantage,
+                lr=self.lr,
+            )
+
+
+def reward_from_run(result) -> float:
+    return (
+        25.0 * result.requests_served
+        + 0.01 * result.tokens_total
+        - 30.0 * result.requests_dropped
+        - 3.0 * result.requests_deferred
+        - 4.0 * result.total_eviction_cost_s
+        - 5.0 * max(result.vram_util_mean - 0.9, 0.0)
+    )
+
+
+def summarize_run(result) -> RLRunMetrics:
+    return RLRunMetrics(
+        reward=reward_from_run(result),
+        throughput_tok_s=result.throughput_tok_s,
+        tokens_total=result.tokens_total,
+        requests_dropped=result.requests_dropped,
+        requests_deferred=result.requests_deferred,
+        total_eviction_cost_s=result.total_eviction_cost_s,
+        mean_vram_util=result.vram_util_mean,
+    )
+
+
+def fine_tune_admission_policy(
+    episodes: int = 12,
+    workload: str = "mixed",
+    n_requests: int = 400,
+    arrival_rate: float = 10.0,
+    vram_gb: float = 16.0,
+    kv_tier: str = "fp16",
+    seed: int = 42,
+    max_concurrent: int = 48,
+) -> FineTuneResult:
+    from ..engine import run
+
+    def _bootstrap_model(model: TinyMLP, bootstrap_seed: int) -> TinyMLP:
+        trainer = ILTrainer(model, lr=5e-3, batch_size=64)
+        rng = np.random.RandomState(bootstrap_seed)
+        for _ in range(512):
+            state = SchedulerState(
+                vram_util=float(rng.uniform(0.1, 0.99)),
+                queue_depth=int(rng.randint(0, 64)),
+                max_queue=64,
+                prompt_len=int(rng.randint(32, 8192)),
+                max_prompt_len=8192,
+                priority=int(rng.randint(1, 4)),
+                est_gen_len=int(rng.randint(16, 2048)),
+                max_gen_len=4096,
+                eviction_rate=float(rng.uniform(0.0, 2.0)),
+                time_since_eviction=float(rng.uniform(0.0, 60.0)),
+            )
+            trainer.add_trace(
+                Trace(
+                    features=extract_features(state),
+                    oracle_admit=1.0 if state.vram_util < 0.85 else 0.0,
+                    oracle_lambda=max(0.05, 1.2 - state.vram_util),
+                )
+            )
+        for _ in range(64):
+            trainer.train_step()
+        return model
+
+    baseline_model = _bootstrap_model(TinyMLP(seed=seed), seed)
+    tuned_model = baseline_model.clone()
+
+    baseline_policy = AdmissionPolicy(model=baseline_model.clone(), warmup_n=10**9)
+    tuned_policy = AdmissionPolicy(model=tuned_model, warmup_n=0)
+    trainer = PolicyGradientTrainer(tuned_policy, lr=1e-4)
+
+    for episode in range(episodes):
+        samples: list[PolicyGradientSample] = []
+        tuned_policy.reset()
+
+        original_decide = tuned_policy.decide
+
+        def _recording_decide(state: SchedulerState, sample: bool = False, rng=None):
+            decision = original_decide(state, sample=True, rng=rng)
+            samples.append(
+                PolicyGradientSample(
+                    features=decision.features,
+                    action=decision.admit,
+                    probability=decision.probability,
+                )
+            )
+            return decision
+
+        tuned_policy.decide = _recording_decide  # type: ignore[method-assign]
+        run_result = run(
+            policy="perc",
+            workload=workload,
+            n_requests=n_requests,
+            arrival_rate=arrival_rate,
+            vram_gb=vram_gb,
+            seed=seed + episode,
+            kv_tier=kv_tier,
+            max_concurrent=max_concurrent,
+            admission_policy=tuned_policy,
+            admission_sample=True,
+        )
+        tuned_policy.decide = original_decide  # type: ignore[method-assign]
+        trainer.update_episode(samples, reward_from_run(run_result))
+
+    baseline_rewards = []
+    tuned_rewards = []
+    baseline_drops = []
+    tuned_drops = []
+    baseline_costs = []
+    tuned_costs = []
+
+    for eval_seed in range(seed + 100, seed + 104):
+        baseline_policy.reset()
+        tuned_policy.reset()
+        baseline_result = run(
+            policy="perc",
+            workload=workload,
+            n_requests=n_requests,
+            arrival_rate=arrival_rate,
+            vram_gb=vram_gb,
+            seed=eval_seed,
+            kv_tier=kv_tier,
+            max_concurrent=max_concurrent,
+            admission_policy=baseline_policy,
+            admission_sample=False,
+        )
+        tuned_result = run(
+            policy="perc",
+            workload=workload,
+            n_requests=n_requests,
+            arrival_rate=arrival_rate,
+            vram_gb=vram_gb,
+            seed=eval_seed,
+            kv_tier=kv_tier,
+            max_concurrent=max_concurrent,
+            admission_policy=tuned_policy,
+            admission_sample=False,
+        )
+        baseline_rewards.append(reward_from_run(baseline_result))
+        tuned_rewards.append(reward_from_run(tuned_result))
+        baseline_drops.append(baseline_result.requests_dropped / max(n_requests, 1))
+        tuned_drops.append(tuned_result.requests_dropped / max(n_requests, 1))
+        baseline_costs.append(baseline_result.total_eviction_cost_s)
+        tuned_costs.append(tuned_result.total_eviction_cost_s)
+
+    baseline_reward = float(np.mean(baseline_rewards))
+    tuned_reward = float(np.mean(tuned_rewards))
+    return FineTuneResult(
+        episodes=episodes,
+        baseline_reward=baseline_reward,
+        tuned_reward=tuned_reward,
+        baseline_drop_rate=float(np.mean(baseline_drops)),
+        tuned_drop_rate=float(np.mean(tuned_drops)),
+        baseline_eviction_cost_s=float(np.mean(baseline_costs)),
+        tuned_eviction_cost_s=float(np.mean(tuned_costs)),
+        improvement_pct=((tuned_reward - baseline_reward) / max(abs(baseline_reward), 1e-6)) * 100.0,
+    )

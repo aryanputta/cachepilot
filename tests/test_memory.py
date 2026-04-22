@@ -1,5 +1,4 @@
-import pytest
-from cachepilot.memory import VRAMPool, BLOCK_SIZE_BYTES
+from cachepilot.memory import VRAMPool
 
 
 class TestVRAMPool:
@@ -50,6 +49,11 @@ class TestVRAMPool:
         b1 = VRAMPool.blocks_needed(512)
         b2 = VRAMPool.blocks_needed(4096)
         assert b2 > b1
+
+    def test_fp8_needs_no_more_blocks_than_fp16(self):
+        fp16 = VRAMPool.blocks_needed_for_tier(4096, "fp16")
+        fp8 = VRAMPool.blocks_needed_for_tier(4096, "fp8")
+        assert fp8 <= fp16
 
     def test_utilization_between_zero_and_one(self):
         pool = self.make_pool()
