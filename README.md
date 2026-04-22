@@ -388,17 +388,7 @@ The profiler handles:
 
 --
 
----
 
-## Next Steps
-
-- [x] Real vLLM smoke test scaffold on GPT-2 / optional LLaMA-2
-- [x] CUDA kernel compilation path via `setup.py` with pybind11
-- [x] RL fine-tuning for AdmissionPolicy with policy gradient
-- [x] Multi-GPU NVLink-aware placement primitive
-- [x] Grafana dashboard export + Prometheus-style telemetry
-- [x] FP8 KV tier support (2x compression vs FP16; 4x would require INT4/NVFP4)
-- [x] End-to-end vLLM benchmark path for CUDA hosts and local model weights
 
 ---
 
