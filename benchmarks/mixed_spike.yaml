@@ -1,0 +1,13 @@
+name: mixed-spike-2k
+workload: mixed
+requests: 2000
+arrival_rate: 10.0
+vram_gb: 24.0
+seed: 42
+spike_at: 500
+spike_multiplier: 4.0
+batch_mode: adaptive
+policies:
+  - perc
+  - lru
+  - priority

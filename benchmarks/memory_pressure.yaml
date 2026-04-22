@@ -1,0 +1,13 @@
+name: memory-pressure
+workload: longctx
+requests: 500
+arrival_rate: 15.0
+vram_gb: 16.0
+seed: 7
+spike_at: 100
+spike_multiplier: 6.0
+batch_mode: max_throughput
+policies:
+  - perc
+  - lru
+  - priority

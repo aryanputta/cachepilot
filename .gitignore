@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg-link
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.cover
+
+# Compiled CUDA objects
+*.o
+*.a
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+*.so
+*.dll
+libkvcopy.so
+libkvquant.so
+
+# Build artifacts from nvcc / CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+
+# Triton cache
+.triton/
+
+# Benchmark outputs (generated, not source)
+results/
+*.png
+*.csv
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Distribution / packaging
+MANIFEST
+*.tar.gz
+*.whl

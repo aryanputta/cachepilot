@@ -1,0 +1,11 @@
+name: chat-latency
+workload: chat
+requests: 1000
+arrival_rate: 5.0
+vram_gb: 24.0
+seed: 99
+spike_at: null
+batch_mode: low_latency
+policies:
+  - perc
+  - lru
