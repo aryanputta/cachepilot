@@ -4,10 +4,14 @@ GPU Triton path is tested separately when CUDA is available.
 """
 
 import numpy as np
-import pytest
 
-from cachepilot.kernels.kv_quantize import quantize_kv_numpy, dequantize_kv_numpy
-from cachepilot.kernels.kv_block_copy import simulate_block_evict, simulate_block_restore, numpy_block_copy, BLOCK_SIZE_BYTES
+from cachepilot.kernels.kv_block_copy import (
+    BLOCK_SIZE_BYTES,
+    numpy_block_copy,
+    simulate_block_evict,
+    simulate_block_restore,
+)
+from cachepilot.kernels.kv_quantize import dequantize_kv_numpy, quantize_kv_numpy
 
 
 class TestKVQuantize:
@@ -118,28 +122,27 @@ class TestVLLMEvictor:
     def test_evictor_add_remove(self):
         from cachepilot.vllm_patch.perc_evictor import PERCEvictor
         ev = PERCEvictor()
-        ev.add(block_id=1, num_hashed_tokens=512)
-        ev.add(block_id=2, num_hashed_tokens=128)
+        ev.add(block_id=1, content_hash=101, num_hashed_tokens=512)
+        ev.add(block_id=2, content_hash=202, num_hashed_tokens=128)
         assert ev.num_blocks == 2
-        bid, ntok = ev.evict()
+        bid, content_hash = ev.evict()
         assert bid in (1, 2)
+        assert content_hash in (101, 202)
         assert ev.num_blocks == 1
 
     def test_evictor_prefers_cheap_block(self):
         """Cheap block (short context, low lambda) should be evicted first."""
-        import time
         from cachepilot.vllm_patch.perc_evictor import PERCEvictor, _BlockRecord
 
         ev = PERCEvictor(c_recompute=0.002, delta_serve=5.0)
-        now = time.monotonic()
 
         # cheap: short context, dormant
-        cheap = _BlockRecord(block_id=1, num_hashed_tokens=64)
+        cheap = _BlockRecord(block_id=1, content_hash=11, num_hashed_tokens=64)
         cheap.intervals.extend([100.0] * 5)  # lambda ≈ 0.01
         ev._blocks[1] = cheap
 
         # costly: long context, active
-        costly = _BlockRecord(block_id=2, num_hashed_tokens=8192)
+        costly = _BlockRecord(block_id=2, content_hash=22, num_hashed_tokens=8192)
         costly.intervals.extend([0.5] * 10)  # lambda ≈ 2.0
         ev._blocks[2] = costly
 
@@ -149,13 +152,14 @@ class TestVLLMEvictor:
     def test_eviction_cost_delta_positive(self):
         """PERC should have lower or equal cost than LRU's choice."""
         import time
+
         from cachepilot.vllm_patch.perc_evictor import PERCEvictor, _BlockRecord
 
         ev = PERCEvictor(c_recompute=0.002, delta_serve=5.0)
         now = time.monotonic()
 
         for i in range(20):
-            r = _BlockRecord(block_id=i, num_hashed_tokens=(i + 1) * 100)
+            r = _BlockRecord(block_id=i, content_hash=i + 1000, num_hashed_tokens=(i + 1) * 100)
             r.intervals.extend([float(i + 1)] * 5)
             r.last_active = now - float(i * 10)
             ev._blocks[i] = r

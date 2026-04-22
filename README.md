@@ -125,8 +125,22 @@ pip install -e ".[dev]"
 # Single benchmark
 cachepilot bench --policy perc --workload mixed --requests 1000
 
+# Same benchmark with FP8 KV tier + Prometheus export
+cachepilot bench --policy perc --workload mixed --requests 1000 --kv-tier fp8 \
+  --prometheus-out results/cachepilot.prom --snapshots-out results/cachepilot.json
+
 # Side-by-side comparison with traffic spike
 cachepilot compare --workload mixed --requests 2000 --spike 500
+
+# Train the admission controller with policy gradient
+cachepilot rl-admission --workload mixed --requests 400 --episodes 12 --kv-tier fp8
+
+# Emit a Grafana dashboard JSON wired to the exported Prometheus metric names
+cachepilot grafana-dashboard --out docs/cachepilot_grafana.json
+
+# Profile real token usage from Hugging Face or a downloaded Kaggle export
+cachepilot profile-dataset --preset oasst1 --limit 1000 --out results/oasst1_tokens.json
+cachepilot profile-dataset --path data/kaggle/chatbot_conversations.csv --out results/kaggle_tokens.json
 
 # From YAML benchmark config
 python scripts/run_bench.py benchmarks/mixed_spike.yaml --out results/mixed.json
@@ -158,6 +172,15 @@ evictor.record_token(block_id)
 
 Measured improvement: **79.3% reduction in expected KV recompute cost** on heterogeneous production-like traffic.
 
+For a real smoke path against actual vLLM installs, the repo now includes:
+
+```bash
+pytest tests/test_vllm_integration.py -m integration
+```
+
+It runs `gpt2` by default when `vllm` is installed and can target LLaMA-2 by
+setting `CACHEPILOT_VLLM_LLAMA_MODEL` to a local path or accessible model ID.
+
 ---
 
 ## CUDA Kernels
@@ -182,6 +205,16 @@ nvcc -O3 -arch=sm_90 -shared -o libkvquant.so src/cuda/kv_quant.cu
 - Compatible with KIVI-style quantization, <0.3 perplexity delta on LLaMA-2-7B
 
 Triton versions (no nvcc required) in `src/cachepilot/kernels/` with automatic NumPy fallback for CPU environments.
+
+There is now also an opt-in native build path through `setup.py` + pybind11:
+
+```bash
+pip install -e ".[native]"
+CACHEPILOT_BUILD_CUDA=1 pip install -e .
+```
+
+The current checkout machine did not have `nvcc`, so the build path is
+implemented but was not compiled here.
 
 ---
 
@@ -216,11 +249,142 @@ Calibrated to public datasets:
 ## Tests
 
 ```bash
-pytest               # 47 tests, all pass
+pytest               # 50 tests pass locally, 1 optional vLLM smoke test skipped without vLLM
 pytest tests/test_eviction.py -v    # PERC theoretical properties
 pytest tests/test_engine.py -v      # eviction cost comparisons
 pytest tests/test_kernels.py -v     # INT8 quantization bounds + vLLM evictor
+cargo test --manifest-path rust/tokenizer/Cargo.toml
 ```
+
+## Native Tokenizer
+
+There is now a built-in Rust tokenizer at `rust/tokenizer/` for fast prompt
+length estimation. Python falls back automatically to
+`src/cachepilot/tokenizer.py` when the native binary is absent.
+
+The tokenizer is now boundary-aware for:
+- punctuation and whitespace
+- camelCase and PascalCase splits
+- digit/alpha transitions
+- denser non-ASCII text
+
+This keeps the estimator cheap while behaving less like a flat
+`chars / constant` rule on code and mixed-format prompts.
+
+```bash
+cargo build --release --manifest-path rust/tokenizer/Cargo.toml
+```
+
+## Model Comparison
+
+To compare your own model against baselines on identical prompts with vLLM:
+
+```bash
+cachepilot compare-models \
+  --candidate path/to/your-model \
+  --baseline gpt2 \
+  --prompts prompts.txt \
+  --out results/model_compare.json
+```
+
+The output highlights where the candidate wins on concrete serving metrics such
+as end-to-end latency and generated tokens per second.
+
+On a CUDA host you can also source prompts directly from Hugging Face datasets
+or local dataset exports:
+
+```bash
+cachepilot compare-models \
+  --candidate /models/your-llm \
+  --baseline TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --preset alpaca \
+  --limit 64 \
+  --max-tokens 64 \
+  --tensor-parallel-size 1 \
+  --out results/model_compare_cuda.json
+```
+
+## End-to-End vLLM Benchmark
+
+For a direct CUDA-host benchmark of plain `vllm` vs `vllm+PERC` on the same
+local model weights:
+
+```bash
+cachepilot vllm-benchmark \
+  --model /models/your-llm \
+  --preset alpaca \
+  --limit 64 \
+  --compare-perc \
+  --max-tokens 64 \
+  --gpu-memory-utilization 0.85 \
+  --out results/vllm_benchmark.json
+```
+
+This command supports:
+- local model paths on the benchmark host
+- prompt files (`--prompts prompts.txt`)
+- Hugging Face datasets (`--hf-dataset yahma/alpaca-cleaned`)
+- local CSV / JSONL / Parquet exports (`--local-dataset data/chatbot.csv`)
+
+Install the serving stack on the CUDA host with:
+
+```bash
+pip install -e .[bench]
+```
+
+To generate a standalone Hugging Face Jobs UV script for the same benchmark:
+
+```bash
+cachepilot render-hf-vllm-job \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --preset alpaca \
+  --limit 48 \
+  --max-tokens 96 \
+  --gpu-memory-utilization 0.55 \
+  --out scripts/hf_vllm_bench.py
+```
+
+## Hardware Scorecard
+
+For a first-principles comparison of compute, bandwidth, and effective KV cache
+capacity across current GPU tiers:
+
+```bash
+cachepilot hardware-scorecard \
+  --model llama3_8b \
+  --context-tokens 2048 \
+  --out results/hardware_scorecard.json
+```
+
+This uses a roofline-style bound:
+- `tok/s <= memory_bandwidth / decode_kv_bytes`
+- `tok/s <= peak_compute / decode_flops`
+- actual ceiling = `min(compute_bound, bandwidth_bound)`
+
+The derivation is documented in [docs/roofline_proofs.md](docs/roofline_proofs.md).
+
+## Dataset Profiling
+
+Use the dataset profiler to measure actual prompt, response, and total token
+distributions before you train or benchmark:
+
+```bash
+# Hugging Face presets
+cachepilot profile-dataset --preset oasst1
+cachepilot profile-dataset --preset alpaca
+cachepilot profile-dataset --preset sharegpt
+
+# Direct Hugging Face repo ID
+cachepilot profile-dataset --hf-dataset OpenAssistant/oasst1 --split train
+
+# Kaggle export after download
+cachepilot profile-dataset --path data/chatbot_conversations.csv
+```
+
+The profiler handles:
+- flat instruction datasets such as Alpaca (`instruction`, `input`, `output`)
+- ShareGPT-style conversation lists
+- Kaggle-style turn tables with `conversation_id`, `role`, and `message`
 
 ---
 
@@ -228,18 +392,19 @@ pytest tests/test_kernels.py -v     # INT8 quantization bounds + vLLM evictor
 
 - Built CachePilot, a GPU memory orchestrator for multi-model LLM serving with a provably optimal KV cache eviction algorithm (PERC), reducing expected KV recompute cost by 25% in simulation and 79% in a vLLM-compatible evictor benchmark vs LRU.
 - Designed PERC (Priority Eviction with Resumption Cost) and proved its optimality via fractional knapsack reduction — jointly models context length and per-session Poisson token arrival rate to minimize expected recompute cost when freeing VRAM.
-- Implemented CUDA C++ kernels for PCIe-saturating KV block eviction (250 µs per 16 MB, 99% overlap with decode) and in-place INT8 KV quantization (50% VRAM reduction, <0.4% relative error bound), plus Triton equivalents and a 47-test suite.
+- Implemented CUDA C++ kernels for PCIe-saturating KV block eviction (250 µs per 16 MB, 99% overlap with decode) and in-place INT8 KV quantization (50% VRAM reduction, <0.4% relative error bound), plus Triton equivalents and a 50-test suite.
 
 ---
 
 ## Next Steps
 
-- [ ] Real vLLM integration test on GPT-2 / LLaMA-2
-- [ ] CUDA kernel compilation via `setup.py` with pybind11
-- [ ] RL fine-tuning for AdmissionPolicy with policy gradient
-- [ ] Multi-GPU NVLink-aware placement
-- [ ] Grafana dashboard with live telemetry export
-- [ ] FP8 KV tier (4x compression vs FP16)
+- [x] Real vLLM smoke test scaffold on GPT-2 / optional LLaMA-2
+- [x] CUDA kernel compilation path via `setup.py` with pybind11
+- [x] RL fine-tuning for AdmissionPolicy with policy gradient
+- [x] Multi-GPU NVLink-aware placement primitive
+- [x] Grafana dashboard export + Prometheus-style telemetry
+- [x] FP8 KV tier support (2x compression vs FP16; 4x would require INT4/NVFP4)
+- [x] End-to-end vLLM benchmark path for CUDA hosts and local model weights
 
 ---
 

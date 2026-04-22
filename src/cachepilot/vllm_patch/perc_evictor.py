@@ -54,10 +54,11 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 
 class _BlockRecord:
-    __slots__ = ("block_id", "num_hashed_tokens", "last_active", "intervals")
+    __slots__ = ("block_id", "content_hash", "num_hashed_tokens", "last_active", "intervals")
 
-    def __init__(self, block_id: int, num_hashed_tokens: int):
+    def __init__(self, block_id: int, content_hash: int, num_hashed_tokens: int):
         self.block_id = block_id
+        self.content_hash = content_hash
         self.num_hashed_tokens = num_hashed_tokens
         self.last_active: float = time.monotonic()
         self.intervals: Deque[float] = deque(maxlen=20)
@@ -111,17 +112,31 @@ class PERCEvictor:
     def num_blocks(self) -> int:
         return len(self._blocks)
 
-    def add(self, block_id: int, num_hashed_tokens: int) -> None:
+    def add(
+        self,
+        block_id: int,
+        content_hash: int,
+        num_hashed_tokens: int,
+        last_accessed: Optional[float] = None,
+    ) -> None:
         """Called by vLLM block manager when a block becomes evictable."""
-        self._blocks[block_id] = _BlockRecord(block_id, num_hashed_tokens)
+        record = _BlockRecord(block_id, content_hash, num_hashed_tokens)
+        if last_accessed is not None:
+            record.last_active = last_accessed
+        self._blocks[block_id] = record
 
     def remove(self, block_id: int) -> _BlockRecord:
         """Called by vLLM when a block is re-allocated (taken off evict list)."""
         return self._blocks.pop(block_id)
 
+    def update(self, block_id: int, last_accessed: float) -> None:
+        if block_id not in self._blocks:
+            raise ValueError("Attempting to update block that's not in the evictor")
+        self._blocks[block_id].last_active = last_accessed
+
     def evict(self) -> Tuple[int, int]:
         """
-        Return (block_id, num_hashed_tokens) for the cheapest block to evict.
+        Return (block_id, content_hash) for the cheapest block to evict.
 
         PERC score per block:
             score = seq_len * c_recompute * P(resume within delta) / 1 block
@@ -136,7 +151,7 @@ class PERCEvictor:
             key=lambda bid: self._perc_score(self._blocks[bid]),
         )
         record = self._blocks.pop(best_id)
-        return record.block_id, record.num_hashed_tokens
+        return record.block_id, record.content_hash
 
     # ------------------------------------------------------------------
     # Instrumentation — call from vLLM scheduler step()
@@ -181,6 +196,36 @@ class PERCEvictor:
         return self._perc_score(self._blocks[lru_choice]) - self._perc_score(self._blocks[perc_choice])
 
 
+def install_into_vllm() -> None:
+    """
+    Monkeypatch vLLM to use PERC for free-block eviction.
+
+    This is intended for smoke/integration tests and local experiments where
+    patching the import graph is easier than maintaining a custom vLLM fork.
+    """
+    import importlib
+
+    evictor_mod = importlib.import_module("vllm.core.evictor")
+
+    def _make_evictor(*args, **kwargs):
+        return PERCEvictor()
+
+    evictor_mod.PERCEvictor = PERCEvictor
+    evictor_mod.LRUEvictor = PERCEvictor
+    if hasattr(evictor_mod, "make_evictor"):
+        evictor_mod.make_evictor = _make_evictor
+
+    for module_name in ("vllm.core.block_manager", "vllm.core.block_manager_v2"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if hasattr(module, "make_evictor"):
+            module.make_evictor = _make_evictor
+        if hasattr(module, "LRUEvictor"):
+            module.LRUEvictor = PERCEvictor
+
+
 # ---------------------------------------------------------------------------
 # Benchmark: PERC vs LRU on a synthetic block set
 # ---------------------------------------------------------------------------
@@ -200,7 +245,7 @@ def benchmark_perc_vs_lru(n_blocks: int = 1000, n_evictions: int = 500, seed: in
     # Populate with heterogeneous blocks
     for i in range(n_blocks):
         seq_len = rng.randint(64, 8192)
-        rec = _BlockRecord(i, seq_len)
+        rec = _BlockRecord(i, i, seq_len)
         # Assign random lambda (activity rate)
         rec.intervals.extend([1.0 / max(rng.gauss(0.5, 0.8), 0.01)] * rng.randint(1, 20))
         rec.last_active = time.monotonic() - rng.uniform(0, 300)

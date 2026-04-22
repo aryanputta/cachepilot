@@ -13,28 +13,32 @@ fills under concurrent load, which cached session gets evicted matters.
 
 from __future__ import annotations
 
-import heapq
 import random
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .batcher import BatchMode, DynamicBatcher
 from .eviction import LRUEviction, PERCEviction, PriorityEviction, EvictionPolicy
 from .kv_manager import KVCacheManager
 from .memory import VRAMPool
-from .scheduler import Priority, RequestQueue, ScheduledRequest
+from .quantization import KVPrecision
+from .scheduler import Priority
 from .simulator import SimRequest, load_generator
-from .telemetry import TelemetryCollector
+from .telemetry import Snapshot, TelemetryCollector
 
-POLICY_MAP: Dict[str, EvictionPolicy] = {
+if TYPE_CHECKING:
+    from .policy.rl_policy import AdmissionPolicy
+
+POLICY_MAP: dict[str, EvictionPolicy] = {
     "perc": PERCEviction(),
     "lru": LRUEviction(),
     "priority": PriorityEviction(),
 }
 
-WORKLOAD_PRESETS: Dict[str, Dict[str, float]] = {
+WORKLOAD_PRESETS: dict[str, dict[str, float]] = {
     "chat": {"chat": 1.0},
     "code": {"code": 1.0},
     "summarize": {"summarize": 1.0},
@@ -48,15 +52,17 @@ class _ActiveSession:
     """A session currently live in the concurrent pool."""
     req: SimRequest
     tokens_done: int = 0
-    tpot_list: List[float] = field(default_factory=list)
+    tpot_list: list[float] = field(default_factory=list)
 
 
 @dataclass
 class RunResult:
     policy: str
     workload: str
+    kv_tier: str
     requests_served: int
     requests_dropped: int
+    requests_deferred: int
     tokens_total: int
     throughput_tok_s: float
     p50_tpot_ms: float
@@ -72,7 +78,7 @@ class RunResult:
     vram_util_peak: float
     wall_time_s: float
 
-    def as_dict(self) -> Dict:
+    def as_dict(self) -> dict:
         return dict(self.__dict__)
 
 
@@ -84,10 +90,15 @@ def run(
     vram_gb: float = 24.0,
     pinned_fraction: float = 0.35,
     seed: int = 42,
-    spike_at: Optional[int] = None,
+    spike_at: int | None = None,
     spike_multiplier: float = 4.0,
     batch_mode: str = "adaptive",
     max_concurrent: int = 32,
+    kv_tier: str = "fp16",
+    admission_policy: "AdmissionPolicy" | None = None,
+    admission_sample: bool = False,
+    max_deferrals: int = 2,
+    telemetry_listener: Callable[[Snapshot, dict[str, float]], None] | None = None,
 ) -> RunResult:
     """
     Simulate a serving system with up to max_concurrent live sessions.
@@ -102,9 +113,10 @@ def run(
     """
     eviction_policy = POLICY_MAP.get(policy, PERCEviction())
     mix = WORKLOAD_PRESETS.get(workload, WORKLOAD_PRESETS["mixed"])
+    kv_precision = KVPrecision.parse(kv_tier)
 
     pool = VRAMPool(total_gb=vram_gb, pinned_gb=vram_gb * pinned_fraction)
-    kv = KVCacheManager(pool, policy=eviction_policy)
+    kv = KVCacheManager(pool, policy=eviction_policy, kv_tier=kv_precision)
     telemetry = TelemetryCollector()
     rng = random.Random(seed + 1)
 
@@ -113,49 +125,133 @@ def run(
     )
 
     # Track per-request results
-    tpot_all: List[float] = []
-    vram_utils: List[float] = []
+    tpot_all: list[float] = []
+    vram_utils: list[float] = []
     served = 0
     dropped = 0
+    deferred_count = 0
     tokens_total = 0
 
-    # Simulate wall time using the arrival timestamps in the load generator
-    sim_time = 0.0
-    request_queue: List[SimRequest] = list(all_requests)  # ordered by arrival
-    next_idx = 0
-    active: List[_ActiveSession] = []
+    pending = deque(all_requests)
+    deferred = deque()
+    deferral_budget: dict[str, int] = {}
+    active: list[_ActiveSession] = []
+    ticks = 0
+    observed_evictions = 0
 
     import time as _time
     wall_start = _time.monotonic()
 
-    while next_idx < len(request_queue) or active:
+    def _request_priority(req: SimRequest) -> Priority:
+        if req.workload == "chat":
+            return Priority.HIGH
+        if req.workload == "code":
+            return Priority.NORMAL
+        return Priority.LOW
+
+    def _emit_snapshot() -> None:
+        snapshot = telemetry.snapshot(
+            pool.stats().utilization,
+            len(pending) + len(deferred),
+            kv.active_sessions,
+        )
+        vram_utils.append(snapshot.vram_util)
+        if telemetry_listener is not None:
+            extra_metrics = {
+                "cachepilot_requests_served_total": float(served),
+                "cachepilot_requests_dropped_total": float(dropped),
+                "cachepilot_requests_deferred_total": float(deferred_count),
+                "cachepilot_tokens_total": float(tokens_total),
+                "cachepilot_eviction_events_total": float(len(kv.eviction_log)),
+                "cachepilot_total_eviction_cost_seconds": float(
+                    sum(e.expected_recompute_cost_s for e in kv.eviction_log)
+                ),
+            }
+            telemetry_listener(snapshot, extra_metrics)
+
+    def _sync_evictions() -> None:
+        nonlocal observed_evictions
+        while observed_evictions < len(kv.eviction_log):
+            telemetry.record_eviction()
+            observed_evictions += 1
+
+    while pending or deferred or active:
         # ------------------------------------------------------------------
         # Admit new sessions up to max_concurrent (or as VRAM allows)
         # ------------------------------------------------------------------
-        while len(active) < max_concurrent and next_idx < len(request_queue):
-            req = request_queue[next_idx]
-            admitted = kv.register_session(req.req_id, req.prompt_len)
+        while len(active) < max_concurrent and (deferred or pending):
+            req = deferred.popleft() if deferred else pending.popleft()
+            # Seed heterogeneous lambda so PERC has a real signal from the start.
+            # Chat/summarize sessions: bursty (λ ~ 0.5–3.0 tok/s)
+            # Code sessions: slow deliberate (λ ~ 0.1–0.5 tok/s)
+            # longctx sessions: very slow (λ ~ 0.02–0.1 tok/s)
+            seed_lambda = {
+                "chat":      rng.uniform(0.3, 3.0),
+                "code":      rng.uniform(0.1, 0.8),
+                "summarize": rng.uniform(0.5, 2.0),
+                "longctx":   rng.uniform(0.02, 0.15),
+            }.get(req.workload, rng.uniform(0.05, 1.0))
+
+            if admission_policy is not None:
+                from .policy.rl_policy import SchedulerState
+
+                state = SchedulerState(
+                    vram_util=pool.stats().utilization,
+                    queue_depth=len(pending) + len(deferred),
+                    max_queue=max(n_requests, 1),
+                    prompt_len=req.prompt_len,
+                    max_prompt_len=16384,
+                    priority=_request_priority(req).value,
+                    est_gen_len=req.max_new_tokens,
+                    max_gen_len=4096,
+                    eviction_rate=telemetry.latest_eviction_rate(),
+                    time_since_eviction=telemetry.time_since_last_eviction(),
+                )
+                decision = admission_policy.decide(state, sample=admission_sample)
+                if not decision.admit:
+                    budget = deferral_budget.get(req.req_id, 0) + 1
+                    deferral_budget[req.req_id] = budget
+                    if budget > max_deferrals:
+                        dropped += 1
+                    else:
+                        deferred.append(req)
+                        deferred_count += 1
+                    continue
+
+            admitted = kv.register_session(
+                req.req_id, req.prompt_len,
+                seed_lambda=seed_lambda,
+                seed_n_intervals=rng.randint(3, 8),
+            )
+            _sync_evictions()
             if admitted:
                 active.append(_ActiveSession(req=req))
-                next_idx += 1
             else:
-                # VRAM exhausted even after eviction attempt — drop request
-                dropped += 1
-                next_idx += 1
+                budget = deferral_budget.get(req.req_id, 0) + 1
+                deferral_budget[req.req_id] = budget
+                if budget > max_deferrals:
+                    dropped += 1
+                else:
+                    deferred.append(req)
+                    deferred_count += 1
 
         if not active:
+            if pending or deferred:
+                _emit_snapshot()
+                continue
             break
 
         # ------------------------------------------------------------------
         # Advance all active sessions by one decode step
         # ------------------------------------------------------------------
-        completed: List[int] = []
+        completed: list[int] = []
         for i, sess in enumerate(active):
             if sess.req.done:
                 completed.append(i)
                 continue
             tokens, latency_s = sess.req.step(batch_size=1, rng=rng)
             ok = kv.extend_session(sess.req.req_id, tokens)
+            _sync_evictions()
             if not ok:
                 # OOM even mid-session — terminate and count as served
                 completed.append(i)
@@ -176,11 +272,9 @@ def run(
                 tokens_total += sess.tokens_done
                 served += 1
 
-        # Telemetry snapshot every N ticks
-        if served % 20 == 0:
-            stats = pool.stats()
-            vram_utils.append(stats.utilization)
-            telemetry.snapshot(stats.utilization, 0, kv.active_sessions)
+        ticks += 1
+        if ticks % 10 == 0:
+            _emit_snapshot()
 
     wall = _time.monotonic() - wall_start
     tpot_arr = np.array(tpot_all) if tpot_all else np.array([0.0])
@@ -188,12 +282,16 @@ def run(
     eviction_log = kv.eviction_log
     total_eviction_cost = sum(e.expected_recompute_cost_s for e in eviction_log)
     n_evictions = len(eviction_log)
+    if not telemetry.snapshots:
+        _emit_snapshot()
 
     return RunResult(
         policy=policy,
         workload=workload,
+        kv_tier=kv_precision.value,
         requests_served=served,
         requests_dropped=dropped,
+        requests_deferred=deferred_count,
         tokens_total=tokens_total,
         throughput_tok_s=tokens_total / max(wall, 1e-3),
         p50_tpot_ms=float(np.percentile(tpot_arr, 50)),

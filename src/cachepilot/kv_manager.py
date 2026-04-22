@@ -11,6 +11,7 @@ from .eviction import (
     select_eviction_set,
 )
 from .memory import VRAMPool
+from .quantization import KVPrecision
 
 
 @dataclass
@@ -41,6 +42,7 @@ class KVCacheManager:
         policy: Optional[EvictionPolicy] = None,
         cpu_offload: bool = True,
         c_recompute: float = 0.002,
+        kv_tier: str | KVPrecision = KVPrecision.FP16,
         n_heads: int = 32,
         head_dim: int = 128,
         n_layers: int = 32,
@@ -49,7 +51,13 @@ class KVCacheManager:
         self._policy = policy or PERCEviction(c_recompute=c_recompute)
         self._cpu_offload = cpu_offload
         self._c_recompute = c_recompute
-        self._head_kwargs = dict(n_heads=n_heads, head_dim=head_dim, n_layers=n_layers)
+        self._kv_tier = KVPrecision.parse(kv_tier)
+        self._head_kwargs = dict(
+            n_heads=n_heads,
+            head_dim=head_dim,
+            n_layers=n_layers,
+            dtype_bytes=self._kv_tier.bytes_per_scalar,
+        )
 
         self._sessions: Dict[str, SessionCacheInfo] = {}
         self._cpu_cache: Dict[str, int] = {}  # session_id -> seq_len
@@ -59,10 +67,22 @@ class KVCacheManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def register_session(self, session_id: str, prompt_len: int) -> bool:
+    def register_session(
+        self,
+        session_id: str,
+        prompt_len: int,
+        seed_lambda: float = 0.0,
+        seed_n_intervals: int = 0,
+    ) -> bool:
         """
         Allocate VRAM for a new session.  Evicts others if needed.
         Returns True if the session was admitted.
+
+        seed_lambda:       Pre-seed this session's activity rate so PERC has
+                           a meaningful signal from the first eviction decision.
+                           Pass 0.0 to start with the default prior.
+        seed_n_intervals:  Number of synthetic intervals to pre-populate from
+                           the seed_lambda rate (simulates session history).
         """
         needed = VRAMPool.blocks_needed(prompt_len, **self._head_kwargs)
 
@@ -73,12 +93,18 @@ class KVCacheManager:
                 return False
 
         now = time.monotonic()
+        intervals: List[float] = []
+        if seed_lambda > 0 and seed_n_intervals > 0:
+            interval_s = 1.0 / seed_lambda
+            intervals = [interval_s] * seed_n_intervals
+
         self._sessions[session_id] = SessionCacheInfo(
             session_id=session_id,
             seq_len=prompt_len,
             n_blocks=needed,
             created_at=now,
             last_active=now,
+            token_intervals=intervals,
         )
         return True
 
@@ -148,6 +174,10 @@ class KVCacheManager:
     @property
     def offloaded_sessions(self) -> int:
         return len(self._cpu_cache)
+
+    @property
+    def kv_tier(self) -> KVPrecision:
+        return self._kv_tier
 
     @property
     def eviction_log(self) -> List[EvictionEvent]:

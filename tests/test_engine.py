@@ -2,16 +2,17 @@
 End-to-end tests. Verifies that PERC produces measurably better results
 than LRU and Priority on a mixed workload with a traffic spike.
 """
-import pytest
+
 from cachepilot.engine import run
 
 
 class TestEngineE2E:
     def test_perc_serves_requests(self):
-        r = run(policy="perc", workload="chat", n_requests=100, seed=0)
+        r = run(policy="perc", workload="chat", n_requests=100, seed=0, kv_tier="fp8")
         assert r.requests_served > 0
         assert r.tokens_total > 0
         assert r.throughput_tok_s > 0
+        assert r.kv_tier == "fp8"
 
     def test_all_policies_complete(self):
         for policy in ["perc", "lru", "priority"]:

@@ -69,3 +69,7 @@ logs/
 MANIFEST
 *.tar.gz
 *.whl
+
+# Rust
+target/
+rust/tokenizer/target/
